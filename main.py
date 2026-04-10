@@ -9,6 +9,7 @@ import os
 import signal
 import time
 import threading
+import tempfile
 from collections import deque
 from datetime import datetime
 
@@ -389,7 +390,7 @@ def seed_database(database, matcher):
 
 def main():
     # Single-instance enforcement
-    LOCKFILE = "/tmp/robo-greeter.pid"
+    LOCKFILE = os.path.join(tempfile.gettempdir(), "robo-greeter.pid")
     _my_pid = os.getpid()
 
     if os.path.exists(LOCKFILE):
