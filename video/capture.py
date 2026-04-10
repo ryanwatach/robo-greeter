@@ -25,9 +25,14 @@ class ThreadedCamera:
         self.thread.start()
 
     def _connect(self):
-        log.info("Connecting to camera: %s", self.config.rtsp_url)
-        self.cap = cv2.VideoCapture(self.config.rtsp_url)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, self.config.buffer_size)
+        if self.config.source_type == "webcam":
+            log.info("Connecting to webcam device: %d", self.config.webcam_device)
+            self.cap = cv2.VideoCapture(self.config.webcam_device)
+        else:
+            log.info("Connecting to camera: %s", self.config.rtsp_url)
+            self.cap = cv2.VideoCapture(self.config.rtsp_url)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, self.config.buffer_size)
+
         if self.cap.isOpened():
             log.info("Camera connected")
         else:

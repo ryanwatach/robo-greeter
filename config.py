@@ -11,17 +11,25 @@ if _env_path.exists():
 
 @dataclass
 class CameraConfig:
+    # Camera source type: "rtsp" for network camera, "webcam" for local device
+    source_type: str = "rtsp"  # "rtsp" or "webcam"
+
+    # For RTSP cameras (Amcrest, etc.)
     host: str = "192.168.1.108"
     port: int = 80
     user: str = "admin"
     password: str = "admin"
     rtsp_url: str = ""
+
+    # For local webcam
+    webcam_device: int = 0  # Device index (0 = default/built-in camera)
+
     processing_scale: float = 0.25
     target_fps: float = 4.0
     buffer_size: int = 1
 
     def __post_init__(self):
-        if not self.rtsp_url:
+        if self.source_type == "rtsp" and not self.rtsp_url:
             self.rtsp_url = (
                 f"rtsp://{self.user}:{self.password}@{self.host}:554"
                 f"/cam/realmonitor?channel=1&subtype=0"
