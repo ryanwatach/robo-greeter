@@ -22,6 +22,49 @@ def _has_microphone() -> bool:
         return False
 
 
+def _find_input_device():
+    """Pick a stable input-device index. Prefers any device whose name
+    contains 'yeti', 'microphone', or 'mic' (in that order). Returns None if
+    nothing matches — in which case we fall back to sounddevice's default."""
+    try:
+        import sounddevice as sd
+        devices = sd.query_devices()
+    except Exception:
+        return None
+    candidates = []
+    for idx, dev in enumerate(devices):
+        if dev.get("max_input_channels", 0) <= 0:
+            continue
+        name = dev.get("name", "").lower()
+        score = None
+        if "yeti" in name:
+            score = 0
+        elif "microphone" in name:
+            score = 1
+        elif "mic" in name:
+            score = 2
+        if score is not None:
+            candidates.append((score, idx, name))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][1]
+
+
+def _reset_portaudio():
+    """PortAudio sometimes wedges its host-API state after another process
+    grabs Core Audio (e.g. afplay finishing playback). Terminate + reinit to
+    get a fresh session."""
+    try:
+        import sounddevice as sd
+        sd._terminate()
+        sd._initialize()
+        return True
+    except Exception as e:
+        log.error("PortAudio reset failed: %s", e)
+        return False
+
+
 class STTEngine:
     """
     Speech-to-text engine.
@@ -42,8 +85,18 @@ class STTEngine:
         self._keyboard_override = False
         self.transcription_callback = None
 
+        # Pin a specific input device by name. PortAudio's idea of "default"
+        # can shift when other apps grab Core Audio; an explicit index sticks.
+        self._input_device = _find_input_device() if self._has_mic else None
+
         if self._has_mic:
-            log.info("STT: microphone detected, using Whisper")
+            try:
+                import sounddevice as sd
+                dev_info = sd.query_devices(self._input_device) if self._input_device is not None else None
+                dev_name = dev_info["name"] if dev_info else "default"
+                log.info("STT: microphone detected (using '%s'), Whisper enabled", dev_name)
+            except Exception:
+                log.info("STT: microphone detected, using Whisper")
             # Preload Whisper in the background so the first listen() doesn't
             # eat 1-2 seconds of model-load latency right when the user speaks.
             threading.Thread(target=self._get_model, daemon=True).start()
@@ -143,11 +196,26 @@ class STTEngine:
         """
         import sounddevice as sd
 
-        try:
-            sd.check_input_settings()
-        except Exception as e:
-            log.error("STT mic unavailable: %s", e)
-            return None
+        device = self._input_device
+
+        def _rec(n):
+            return sd.rec(
+                n, samplerate=sr, channels=1, dtype="float32",
+                device=device,
+            )
+
+        # Verify the device works right now. If PortAudio's host state has
+        # wedged (paInternalError after a prior afplay session, etc.), reset
+        # and try once more.
+        for attempt in (1, 2):
+            try:
+                sd.check_input_settings(device=device) if device is not None else sd.check_input_settings()
+                break
+            except Exception as e:
+                log.warning("STT mic unavailable (attempt %d): %s", attempt, e)
+                if attempt == 1 and _reset_portaudio():
+                    continue
+                return None
 
         sr = self.config.sample_rate
         chunk_dur = 0.10
@@ -159,7 +227,7 @@ class STTEngine:
         cal_rms = []
         for _ in range(calibration_chunks):
             try:
-                a = sd.rec(chunk_samples, samplerate=sr, channels=1, dtype="float32")
+                a = _rec(chunk_samples)
                 sd.wait()
             except Exception as e:
                 log.error("STT calibration error: %s: %s", type(e).__name__, e)
@@ -182,7 +250,7 @@ class STTEngine:
                     self._keyboard_override = False
                     return None
             try:
-                audio = sd.rec(chunk_samples, samplerate=sr, channels=1, dtype="float32")
+                audio = _rec(chunk_samples)
                 sd.wait()
             except Exception as e:
                 log.error("STT recording error: %s: %s", type(e).__name__, e)

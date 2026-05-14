@@ -8,6 +8,8 @@ from collections import deque
 import google.genai as genai
 from google.genai import types as genai_types
 
+from interaction.jarvis_context import build_system_instruction
+
 from audio.audio_manager import AudioManager
 from utils.logger import setup_logger
 
@@ -39,6 +41,9 @@ class ConversationManager:
         # calling. The SDK introspects type hints + docstrings to generate
         # the tool schema and invokes them when the model decides to call.
         self.tools = list(tools or [])
+        # Persistent identity/location/role context for Jarvis. Sent as the
+        # `system_instruction` so it stays in effect across all turns.
+        self.system_instruction = build_system_instruction()
 
     def _listen_with_face_check(self, timeout: float = 8.0) -> Optional[str]:
         """Listen for STT input. If STT times out but the user is still
@@ -157,11 +162,14 @@ Keep it brief and natural."""
         (Jarvis responds to user input), "goodbye", or "general"."""
         try:
             log.info(f"Calling Gemini API with model: {self.model_name}")
-            # Only attach tools on follow-up turns — initial/goodbye prompts
-            # are one-shot generations and never need to call back into the DB.
-            cfg = None
+            # Build the request config: always include system_instruction so
+            # Jarvis stays in character + grounded in lab/location. Only
+            # attach tools on follow-up turns — initial/goodbye prompts are
+            # one-shot generations that don't need to call back into the DB.
+            cfg_kwargs = {"system_instruction": self.system_instruction}
             if self.tools and kind == "followup":
-                cfg = genai_types.GenerateContentConfig(tools=self.tools)
+                cfg_kwargs["tools"] = self.tools
+            cfg = genai_types.GenerateContentConfig(**cfg_kwargs)
             response = self.client.models.generate_content(
                 model=self.model_name,
                 contents=prompt,
