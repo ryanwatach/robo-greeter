@@ -1,3 +1,4 @@
+import csv
 import os
 import sqlite3
 from typing import List, Optional, Tuple
@@ -22,6 +23,14 @@ CREATE TABLE IF NOT EXISTS embeddings (
     person_id INTEGER NOT NULL,
     embedding BLOB NOT NULL,
     captured_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (person_id) REFERENCES persons(id)
+);
+
+CREATE TABLE IF NOT EXISTS check_ins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    checked_in_at TEXT DEFAULT (datetime('now', 'localtime')),
     FOREIGN KEY (person_id) REFERENCES persons(id)
 );
 """
@@ -97,6 +106,46 @@ class FaceDatabase:
 
     def person_count(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM persons").fetchone()[0]
+
+    # ── Check-ins ────────────────────────────────────────────────
+
+    def record_check_in(self, person_id: int, name: str) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO check_ins (person_id, name) VALUES (?, ?)",
+            (person_id, name),
+        )
+        self.conn.commit()
+        log.info("Recorded check-in: %s (person_id=%d)", name, person_id)
+        return cur.lastrowid
+
+    def get_check_ins(self, limit: int = 500) -> List[Tuple[int, int, str, str]]:
+        """Return rows of (id, person_id, name, checked_in_at), newest first."""
+        return self.conn.execute(
+            "SELECT id, person_id, name, checked_in_at "
+            "FROM check_ins ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    def get_check_ins_for_person(self, person_id: int, limit: int = 50) -> List[Tuple[int, str]]:
+        """Return rows of (id, checked_in_at) for one person, newest first."""
+        return self.conn.execute(
+            "SELECT id, checked_in_at FROM check_ins "
+            "WHERE person_id = ? ORDER BY id DESC LIMIT ?",
+            (person_id, limit),
+        ).fetchall()
+
+    def export_check_ins_csv(self, path: str) -> int:
+        """Dump every check-in to a CSV file. Returns row count."""
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        rows = self.conn.execute(
+            "SELECT id, person_id, name, checked_in_at "
+            "FROM check_ins ORDER BY id DESC"
+        ).fetchall()
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["id", "person_id", "name", "checked_in_at"])
+            writer.writerows(rows)
+        return len(rows)
 
     @staticmethod
     def _serialize(emb: np.ndarray) -> bytes:

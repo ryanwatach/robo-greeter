@@ -39,3 +39,8 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# Runtime data (biometric DB, check-in logs, per-person snapshots). Folder is
+# kept via .gitkeep so the app has somewhere to write on first run.
+data/*
+!data/.gitkeep

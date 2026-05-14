@@ -1,6 +1,7 @@
 import threading
 import time
 import os
+from collections import deque
 from typing import Optional
 
 import numpy as np
@@ -16,7 +17,8 @@ def _has_microphone() -> bool:
         import sounddevice as sd
         sd.check_input_settings()
         return True
-    except Exception:
+    except Exception as e:
+        log.warning("STT mic check failed: %s: %s", type(e).__name__, e)
         return False
 
 
@@ -42,6 +44,9 @@ class STTEngine:
 
         if self._has_mic:
             log.info("STT: microphone detected, using Whisper")
+            # Preload Whisper in the background so the first listen() doesn't
+            # eat 1-2 seconds of model-load latency right when the user speaks.
+            threading.Thread(target=self._get_model, daemon=True).start()
         else:
             log.info("STT: no microphone, using on-screen keyboard input")
 
@@ -125,22 +130,50 @@ class STTEngine:
         return self._model
 
     def _record_until_silence(self, timeout: float) -> Optional[np.ndarray]:
+        """Capture from the mic in short chunks until the user stops talking.
+
+        Improvements over the previous version (which felt sluggish):
+        - 100ms chunks instead of 500ms → speech-start latency drops 5×.
+        - 300ms pre-roll buffer keeps the audio just *before* voicing was
+          detected, so we never clip the first phoneme of a word.
+        - Energy threshold is auto-calibrated from the first 400ms of room
+          tone, scaled 4× above noise floor, with a floor and ceiling.
+        - Shorter silence cutoff (0.8s) so we transcribe faster after the
+          user finishes a sentence.
+        """
         import sounddevice as sd
 
         try:
             sd.check_input_settings()
-        except Exception:
+        except Exception as e:
+            log.error("STT mic unavailable: %s", e)
             return None
 
         sr = self.config.sample_rate
-        chunk_dur = 0.5
+        chunk_dur = 0.10
         chunk_samples = int(sr * chunk_dur)
-        silence_limit = self.config.silence_threshold
-        energy_threshold = 0.01
+        silence_limit = 0.8
 
+        # Calibrate noise floor from the first few chunks of room tone.
+        calibration_chunks = 4  # 400ms
+        cal_rms = []
+        for _ in range(calibration_chunks):
+            try:
+                a = sd.rec(chunk_samples, samplerate=sr, channels=1, dtype="float32")
+                sd.wait()
+            except Exception as e:
+                log.error("STT calibration error: %s: %s", type(e).__name__, e)
+                return None
+            cal_rms.append(float(np.sqrt(np.mean(a.flatten() ** 2))))
+        noise = float(np.median(cal_rms))
+        # Speech needs to be clearly above noise — 4× with floor/ceiling.
+        energy_threshold = max(0.003, min(0.05, noise * 4.0))
+        log.info("STT: noise=%.4f threshold=%.4f", noise, energy_threshold)
+
+        pre_roll = deque(maxlen=3)  # 300ms of audio just before speech started
         chunks = []
         speaking = False
-        silence_start = None
+        silence_start: Optional[float] = None
         start_time = time.monotonic()
 
         while time.monotonic() - start_time < timeout:
@@ -148,21 +181,31 @@ class STTEngine:
                 if self._keyboard_override:
                     self._keyboard_override = False
                     return None
-            audio = sd.rec(chunk_samples, samplerate=sr, channels=1, dtype="float32")
-            sd.wait()
+            try:
+                audio = sd.rec(chunk_samples, samplerate=sr, channels=1, dtype="float32")
+                sd.wait()
+            except Exception as e:
+                log.error("STT recording error: %s: %s", type(e).__name__, e)
+                return None
             chunk = audio.flatten()
-            rms = np.sqrt(np.mean(chunk ** 2))
+            rms = float(np.sqrt(np.mean(chunk ** 2)))
 
-            if rms > energy_threshold:
-                speaking = True
-                silence_start = None
+            if not speaking:
+                pre_roll.append(chunk)
+                if rms > energy_threshold:
+                    speaking = True
+                    chunks.extend(pre_roll)
+                    silence_start = None
+                    log.info("STT: speech detected (rms=%.4f)", rms)
+            else:
                 chunks.append(chunk)
-            elif speaking:
-                chunks.append(chunk)
-                if silence_start is None:
-                    silence_start = time.monotonic()
-                elif time.monotonic() - silence_start > silence_limit:
-                    break
+                if rms > energy_threshold:
+                    silence_start = None
+                else:
+                    if silence_start is None:
+                        silence_start = time.monotonic()
+                    elif time.monotonic() - silence_start > silence_limit:
+                        break
 
         if not chunks:
             return None

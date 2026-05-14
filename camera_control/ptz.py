@@ -32,6 +32,12 @@ class PTZController:
         self._stale_threshold: float = 0.5
         self._last_active_time: float = time.monotonic()
         self._is_home: bool = True
+        # Hysteresis: once the face is parked inside dead_zone, require a
+        # larger movement (unlock_threshold) before correcting again. This
+        # kills tiny rubber-banding at center while staying responsive when
+        # the face actually moves.
+        self._locked_x: bool = True
+        self._locked_y: bool = True
 
         self._thread = threading.Thread(target=self._control_loop, daemon=True)
         self._thread.start()
@@ -121,21 +127,38 @@ class PTZController:
             dy = self._smoothed_y
 
             moved = False
-            dur = self.config.move_duration
+            max_dur = self.config.move_duration
+            gain = self.config.move_gain
+            max_spd_h = self.config.horizontal_speed
+            max_spd_v = self.config.vertical_speed
 
-            if abs(dx) > self.config.dead_zone_x:
-                if dx > 0:
-                    self._move("right", 1, dur)
-                else:
-                    self._move("left", 1, dur)
-                moved = True
+            # Hysteresis: when "locked" (parked near center), require a larger
+            # offset to re-engage. Once we move, drop back to dead_zone for
+            # tight tracking until we re-center.
+            engage_x = self.config.unlock_threshold_x if self._locked_x else self.config.dead_zone_x
+            engage_y = self.config.unlock_threshold_y if self._locked_y else self.config.dead_zone_y
 
-            if abs(dy) > self.config.dead_zone_y:
-                if dy > 0:
-                    self._move("down", 1, dur)
-                else:
-                    self._move("up", 1, dur)
+            if abs(dx) > engage_x:
+                mag = abs(dx)
+                spd = max(1, min(max_spd_h, int(mag * max_spd_h + 0.5)))
+                dur_x = min(max_dur, mag * gain)
+                direction = "right" if dx > 0 else "left"
+                self._move(direction, spd, dur_x)
                 moved = True
+                self._locked_x = False
+            elif abs(dx) < self.config.dead_zone_x:
+                self._locked_x = True
+
+            if abs(dy) > engage_y:
+                mag = abs(dy)
+                spd = max(1, min(max_spd_v, int(mag * max_spd_v + 0.5)))
+                dur_y = min(max_dur, mag * gain)
+                direction = "down" if dy > 0 else "up"
+                self._move(direction, spd, dur_y)
+                moved = True
+                self._locked_y = False
+            elif abs(dy) < self.config.dead_zone_y:
+                self._locked_y = True
 
             if moved:
                 self._last_command_time = now

@@ -1,3 +1,4 @@
+import json
 import os
 import random
 import re
@@ -14,7 +15,17 @@ from interaction.conversation_manager import ConversationManager
 from tracking.tracker import TrackedFace
 from utils.logger import setup_logger
 
-SNAPSHOT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "faces")
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+SNAPSHOT_DIR = os.path.join(DATA_DIR, "faces")  # legacy snapshot dir (kept)
+PEOPLE_DIR = os.path.join(DATA_DIR, "people")    # per-person folders
+
+
+def _safe_name(name: str) -> str:
+    return re.sub(r"[^\w\-]", "_", name)
+
+
+def _person_dir(person_id: int, name: str) -> str:
+    return os.path.join(PEOPLE_DIR, f"{person_id:03d}_{_safe_name(name)}")
 
 log = setup_logger("robo-greeter")
 
@@ -32,8 +43,120 @@ class GreeterLogic:
         self.audio = audio
         self.database = database
         self.matcher = matcher
-        self.conversation_manager = ConversationManager(audio, gemini_api_key)
         self._current_frame: Optional[np.ndarray] = None
+        # Face presence: when a face was last seen (monotonic time)
+        self._face_last_seen: float = time.monotonic()
+        self.conversation_manager = ConversationManager(
+            audio, gemini_api_key,
+            face_absent_seconds=self.face_absent_seconds,
+            tools=self._build_db_tools(),
+        )
+
+    def _build_db_tools(self):
+        """Return plain-Python callables exposed to Gemini for function
+        calling. The genai SDK introspects signatures + docstrings to build
+        the tool schema and invokes them automatically when the model asks.
+        These run synchronously in the conversation thread."""
+        db = self.database
+
+        def get_visit_count(name: str) -> int:
+            """Return how many times the named person has checked in. Returns 0 if the person is not known."""
+            row = db.conn.execute(
+                "SELECT visit_count FROM persons WHERE LOWER(name) = LOWER(?)",
+                (name,),
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+        def get_last_visit(name: str) -> str:
+            """Return the most recent check-in timestamp for a person as an ISO-like string, or 'never' if the person has never checked in."""
+            row = db.conn.execute(
+                "SELECT last_seen FROM persons WHERE LOWER(name) = LOWER(?)",
+                (name,),
+            ).fetchone()
+            return row[0] if row and row[0] else "never"
+
+        def count_checkins_today() -> int:
+            """Return the number of check-ins recorded today (local time)."""
+            row = db.conn.execute(
+                "SELECT COUNT(*) FROM check_ins WHERE date(checked_in_at) = date('now', 'localtime')"
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+        def list_known_people() -> list:
+            """Return the names of all people enrolled in the system."""
+            rows = db.conn.execute("SELECT name FROM persons ORDER BY name").fetchall()
+            return [r[0] for r in rows]
+
+        def get_recent_checkins(limit: int = 10) -> list:
+            """Return the most recent check-ins as a list of {name, time} entries (newest first). limit is capped at 50."""
+            limit = max(1, min(50, int(limit)))
+            rows = db.conn.execute(
+                "SELECT name, checked_in_at FROM check_ins ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [{"name": n, "time": t} for n, t in rows]
+
+        return [
+            get_visit_count,
+            get_last_visit,
+            count_checkins_today,
+            list_known_people,
+            get_recent_checkins,
+        ]
+
+    def update_face_presence(self, face_present: bool):
+        """Called by main loop each frame so the conversation flow knows
+        whether the user is currently in front of the camera."""
+        if face_present:
+            self._face_last_seen = time.monotonic()
+
+    def face_absent_seconds(self) -> float:
+        return time.monotonic() - self._face_last_seen
+
+    def save_person_record(
+        self,
+        person_id: int,
+        name: str,
+        track: Optional[TrackedFace] = None,
+        frame: Optional[np.ndarray] = None,
+        write_snapshot: bool = False,
+    ):
+        """Maintain a per-person folder at data/people/{id}_{name}/ with a
+        face snapshot (likeness) and a details.json (name, id, dates,
+        visit_count, recent check-ins). Called on enrollment and on every
+        check-in so details.json stays current."""
+        try:
+            pdir = _person_dir(person_id, name)
+            os.makedirs(pdir, exist_ok=True)
+
+            snap_path = os.path.join(pdir, "snapshot.jpg")
+            if write_snapshot and frame is not None and track is not None:
+                top, right, bottom, left = track.bbox
+                h, w = frame.shape[:2]
+                pad = 40
+                top = max(0, top - pad)
+                left = max(0, left - pad)
+                bottom = min(h, bottom + pad)
+                right = min(w, right + pad)
+                face_img = frame[top:bottom, left:right]
+                if face_img.size > 0:
+                    cv2.imwrite(snap_path, face_img)
+
+            info = self.database.get_person_by_id(person_id) or {}
+            recent = self.database.get_check_ins_for_person(person_id, limit=20)
+            details = {
+                "id": person_id,
+                "name": name,
+                "created_at": info.get("created_at"),
+                "last_seen": info.get("last_seen"),
+                "visit_count": info.get("visit_count"),
+                "snapshot": os.path.basename(snap_path) if os.path.exists(snap_path) else None,
+                "recent_check_ins": [{"id": cid, "at": at} for cid, at in recent],
+            }
+            with open(os.path.join(pdir, "details.json"), "w") as f:
+                json.dump(details, f, indent=2)
+        except Exception as e:
+            log.warning("save_person_record failed for %s: %s", name, e)
 
     def save_face_snapshot(self, name: str, track: TrackedFace, frame: Optional[np.ndarray] = None):
         """Save a cropped face image for reference."""
@@ -86,9 +209,11 @@ class GreeterLogic:
         elif names and unknown_count > 0:
             self._greet_mixed(names, unknown_tracks)
 
-        # Update visit counts
+        # Update visit counts, record a check-in, refresh per-person folder
         for name, pid in known_names:
             self.database.update_last_seen(pid)
+            self.database.record_check_in(pid, name)
+            self.save_person_record(pid, name)
 
     def _greet_known_only(self, names: List[str]):
         if len(names) == 1:
@@ -143,6 +268,8 @@ class GreeterLogic:
             person_id = self.database.add_person(name, embeddings)
             self.matcher.reload_database()
             self.save_face_snapshot(name, track, self._current_frame)
+            self.database.record_check_in(person_id, name)
+            self.save_person_record(person_id, name, track, self._current_frame, write_snapshot=True)
             self.audio.say(
                 f"A pleasure to meet you, {name}. "
                 "I'll remember you from now on. You're all checked in."
@@ -172,6 +299,8 @@ class GreeterLogic:
             pid = self.database.add_person(name, embeddings)
             self.matcher.reload_database()
             self.save_face_snapshot(name, track, self._current_frame)
+            self.database.record_check_in(pid, name)
+            self.save_person_record(pid, name, track, self._current_frame, write_snapshot=True)
             self.audio.say(f"Got it, {name}. You're checked in.")
             log.info("Enrolled: %s (id=%d)", name, pid)
 

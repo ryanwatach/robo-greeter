@@ -1,10 +1,12 @@
 import os
 import json
 import datetime
+import random
 from typing import List, Optional
 from collections import deque
 
 import google.genai as genai
+from google.genai import types as genai_types
 
 from audio.audio_manager import AudioManager
 from utils.logger import setup_logger
@@ -22,14 +24,33 @@ GOODBYE_KEYWORDS = {
 class ConversationManager:
     """Real-time conversational AI powered by Google Gemini."""
 
-    def __init__(self, audio: AudioManager, api_key: str):
+    FACE_ABSENT_GOODBYE_SECONDS = 2.0  # how long face must be gone before we end the conversation
+
+    def __init__(self, audio: AudioManager, api_key: str, face_absent_seconds=None, tools=None):
         self.audio = audio
         self.api_key = api_key
         self.client = genai.Client(api_key=api_key)
-        self.model_name = "gemini-1.5-flash"  # Better free tier limits than 2.0
+        self.model_name = "gemini-2.5-flash"  # 1.5 was retired
         self.conversation_history = deque(maxlen=6)  # Keep last 3 exchanges
         self.api_call_count = 0
         self.max_free_tier_calls = 3  # Rough limit for free tier per conversation
+        self._face_absent_seconds = face_absent_seconds or (lambda: 999.0)
+        # Plain Python callables exposed to Gemini for automatic function
+        # calling. The SDK introspects type hints + docstrings to generate
+        # the tool schema and invokes them when the model decides to call.
+        self.tools = list(tools or [])
+
+    def _listen_with_face_check(self, timeout: float = 8.0) -> Optional[str]:
+        """Listen for STT input. If STT times out but the user is still
+        visible (face seen within the last FACE_ABSENT_GOODBYE_SECONDS), keep
+        listening. Returns the user input, or None only if the user has truly
+        left (face absent past the threshold)."""
+        while True:
+            user_input = self.audio.stt.listen(timeout=timeout)
+            if user_input:
+                return user_input
+            if self._face_absent_seconds() >= self.FACE_ABSENT_GOODBYE_SECONDS:
+                return None
 
     def start_conversation(self, names: List[str]):
         """Begin a natural conversation after sign-in."""
@@ -38,13 +59,13 @@ class ConversationManager:
 
         # Initial greeting + question
         initial_prompt = self._build_initial_prompt(name_str, time_period)
-        initial_response = self._call_gemini(initial_prompt)
+        initial_response = self._call_gemini(initial_prompt, kind="initial")
 
         self.audio.say(initial_response)
         self.conversation_history.append({"role": "assistant", "content": initial_response})
 
         # Listen to response
-        user_input = self.audio.stt.listen(timeout=8.0)
+        user_input = self._listen_with_face_check(timeout=8.0)
         if not user_input:
             self.audio.say("No worries. Have a great day!")
             return
@@ -76,13 +97,13 @@ class ConversationManager:
 
         # Generate contextual response
         follow_up_prompt = self._build_follow_up_prompt(user_input, name_str)
-        response = self._call_gemini(follow_up_prompt)
+        response = self._call_gemini(follow_up_prompt, kind="followup")
 
         self.audio.say(response)
         self.conversation_history.append({"role": "assistant", "content": response})
 
         # Listen for next input
-        next_input = self.audio.stt.listen(timeout=8.0)
+        next_input = self._listen_with_face_check(timeout=8.0)
         if not next_input:
             goodbye = self._generate_goodbye(name_str)
             self.audio.say(goodbye)
@@ -129,15 +150,24 @@ Respond naturally (1-2 sentences max). Be warm, genuine, and conversational.
 Ask a follow-up question to keep them engaged, OR wrap up the conversation gracefully.
 Keep it brief and natural."""
 
-    def _call_gemini(self, prompt: str) -> str:
-        """Call Gemini API and return response. Falls back to local responses if quota exceeded."""
+    def _call_gemini(self, prompt: str, kind: str = "general") -> str:
+        """Call Gemini API and return response. Falls back to a context-aware
+        local response if Gemini is unavailable (quota, model 404, etc.).
+        `kind` is "initial" (Jarvis asks how the user is), "followup"
+        (Jarvis responds to user input), "goodbye", or "general"."""
         try:
             log.info(f"Calling Gemini API with model: {self.model_name}")
+            # Only attach tools on follow-up turns — initial/goodbye prompts
+            # are one-shot generations and never need to call back into the DB.
+            cfg = None
+            if self.tools and kind == "followup":
+                cfg = genai_types.GenerateContentConfig(tools=self.tools)
             response = self.client.models.generate_content(
                 model=self.model_name,
-                contents=prompt
+                contents=prompt,
+                config=cfg,
             )
-            text = response.text.strip()
+            text = (response.text or "").strip()
             log.info(f"Gemini response: {text}")
             self.api_call_count += 1
             return text
@@ -146,24 +176,44 @@ Keep it brief and natural."""
             if ("429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower() or
                 "404" in error_str or "NOT_FOUND" in error_str):
                 log.warning(f"Gemini API unavailable ({error_str[:50]}...), using local response fallback")
-                return self._get_local_response(prompt)
+                return self._get_local_response(prompt, kind)
             else:
                 log.error(f"Gemini API error: {e}")
                 return "Sorry, let me try that again."
 
-    def _get_local_response(self, prompt: str) -> str:
-        """Generate a simple local response when API quota is exceeded."""
-        # Simple rule-based conversation fallback
-        if "how are you" in prompt.lower() or "how are you doing" in prompt.lower():
-            return "I'm doing well, thank you for asking! How can I help you today?"
-        elif "what" in prompt.lower() and ("name" in prompt.lower() or "you" in prompt.lower()):
-            return "I'm Jarvis, your office greeter. Nice to meet you!"
-        elif "how" in prompt.lower():
-            return "That's an interesting question. I'm here to help with your check-in process."
-        elif any(word in prompt.lower() for word in ["good", "great", "excellent", "thanks", "thank"]):
-            return "That's wonderful! I'm glad to hear that. Is there anything else I can help you with?"
-        else:
-            return "That sounds interesting. Tell me more about that."
+    def _get_local_response(self, prompt: str, kind: str = "general") -> str:
+        """Context-aware local fallback. The previous version inspected the
+        prompt text and matched 'how are you' in the META instructions,
+        which made Jarvis answer "I'm doing well..." even though Jarvis was
+        the one supposed to be asking. `kind` disambiguates."""
+        if kind == "initial":
+            # Jarvis is supposed to ASK how the user is doing.
+            return random.choice([
+                "How are you doing today?",
+                "How's everything going with you?",
+                "How are you feeling so far today?",
+                "How's your day been?",
+            ])
+
+        if kind == "goodbye":
+            return "Take care, have a wonderful day!"
+
+        if kind == "followup":
+            lower = prompt.lower()
+            # Pull just the user's last line out of the history-rich prompt
+            user_tail = ""
+            for line in reversed(prompt.splitlines()):
+                if line.lower().startswith("user:"):
+                    user_tail = line.split(":", 1)[1].strip().lower()
+                    break
+            text = user_tail or lower
+            if any(w in text for w in ("good", "great", "excellent", "fine", "well", "alright", "okay", "ok")):
+                return "Glad to hear that! Anything I can help you with before you head in?"
+            if any(w in text for w in ("bad", "tired", "rough", "stressed", "not great")):
+                return "Sorry to hear that. I hope your day gets better from here."
+            return "Got it. Anything I can help you with before you head in?"
+
+        return "I'm here to help with your check-in."
 
     def _generate_goodbye(self, name_str: str) -> str:
         """Generate personalized goodbye."""
@@ -173,13 +223,7 @@ Examples: "Great talking with you! Have a wonderful day!"
 or "Take care, and see you soon!"
 
 Respond ONLY with the goodbye message, nothing else."""
-
-        try:
-            response = self.model.generate_content(prompt)
-            return response.text.strip()
-        except Exception as e:
-            log.error(f"Goodbye generation error: {e}")
-            return f"Take care, {name_str}!"
+        return self._call_gemini(prompt, kind="goodbye")
 
     def _is_goodbye(self, text: str) -> bool:
         """Detect goodbye keywords."""

@@ -57,13 +57,16 @@ class IdentityConfig:
 
 @dataclass
 class PTZConfig:
-    dead_zone_x: float = 0.70
-    dead_zone_y: float = 0.70
-    horizontal_speed: int = 1
-    vertical_speed: int = 1
-    update_interval: float = 1.2
-    smoothing_alpha: float = 0.10
-    move_duration: float = 0.06
+    dead_zone_x: float = 0.10      # while tracking, stop correcting inside this band
+    dead_zone_y: float = 0.10
+    unlock_threshold_x: float = 0.20  # once parked at center, must move past this to re-engage (hysteresis)
+    unlock_threshold_y: float = 0.20
+    horizontal_speed: int = 5      # MAX speed; actual speed scales with offset
+    vertical_speed: int = 5
+    update_interval: float = 0.45  # wait between moves so new detection sees post-move position
+    smoothing_alpha: float = 1.0   # 1.0 = no smoothing, react to raw offset
+    move_duration: float = 0.12    # max single-move duration; actual is proportional
+    move_gain: float = 0.20        # duration = min(move_duration, abs(offset) * gain)
 
 
 @dataclass

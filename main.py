@@ -7,6 +7,8 @@ Press 'q' to quit. Press 'b' to build DB from ryan.jpg.
 """
 import os
 import signal
+import subprocess
+import sys
 import time
 import threading
 import tempfile
@@ -323,7 +325,7 @@ def build_dashboard(frame, tracks, primary_id, state, match_result, db_count, fp
     py = h - 40
     cv2.putText(canvas, f"FPS: {fps:.1f}", (px, py), FONT_SMALL, 1.0, C_GRAY, 1, cv2.LINE_AA)
     py += 20
-    cv2.putText(canvas, "Q: Quit  B: Build  M: Mute", (px, py), FONT_SMALL, 1.0, C_GRAY, 1, cv2.LINE_AA)
+    cv2.putText(canvas, "Q:Quit  B:Build  M:Mute  L:Check-in Log", (px, py), FONT_SMALL, 1.0, C_GRAY, 1, cv2.LINE_AA)
 
     # Chat panel
     if chat_log:
@@ -473,6 +475,11 @@ def main():
                 tracks = tracker.update(detections)
                 active_tracks = tracker.get_active_tracks()
 
+                # Tell the greeter whether a face is currently visible — used
+                # to debounce conversation end so brief detection flickers
+                # don't trigger goodbyes.
+                greeter.update_face_presence(len(active_tracks) > 0)
+
                 primary_id = selector.select(tracks, sm.current_subject_id)
 
                 # Update match result for UI
@@ -584,6 +591,20 @@ def main():
                 seed_database(database, matcher)
             elif key == ord("m"):
                 tts.toggle_mute()
+            elif key == ord("l"):
+                # Export check-in log to CSV and open it in the default app
+                log_csv = os.path.join(os.path.dirname(__file__), "data", "check_ins.csv")
+                try:
+                    n = database.export_check_ins_csv(log_csv)
+                    log.info("Exported %d check-ins to %s", n, log_csv)
+                    if sys.platform == "darwin":
+                        subprocess.Popen(["open", log_csv])
+                    elif sys.platform.startswith("linux"):
+                        subprocess.Popen(["xdg-open", log_csv])
+                    else:
+                        log.info("Check-in log written to %s", log_csv)
+                except Exception as e:
+                    log.error("Failed to open check-in log: %s", e)
             elif key == 27:
                 pass
             elif conversation_active and 32 <= key < 127:
@@ -608,6 +629,8 @@ def main():
                     ptz.manual_move("up")
                 elif key == ord("d"):
                     ptz.manual_move("right")
+                elif key == ord("s"):
+                    ptz.manual_move("down")
 
     except KeyboardInterrupt:
         log.info("Shutting down...")
