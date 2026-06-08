@@ -8,16 +8,16 @@ An intelligent doorway greeter system that recognizes faces, greets people by na
 
 ## Features
 
-✅ **Real-time Face Recognition** — Detects and recognizes individuals using facial embeddings
-✅ **Natural Greetings** — Greets known people by name with synthesized speech
-✅ **Name Enrollment** — Automatically asks and learns names of new visitors
-✅ **Conversational AI** — Holds natural conversations using Google Gemini LLM
-✅ **Caption System** — Always-on captions show all interactions with timestamps
-✅ **Interactive Chat** — Type responses during conversations (even when muted)
-✅ **Camera Tracking** — Smoothly follows subjects with PTZ camera control
-✅ **Persistent Database** — Stores learned identities for future recognition
-✅ **Multi-Camera Support** — Works with Amcrest PTZ cameras or any local webcam
-✅ **Graceful Degradation** — Handles failures with natural fallback responses
+**Real-time Face Recognition** — Detects and recognizes individuals using facial embeddings
+**Natural Greetings** — Greets known people by name with synthesized speech
+**Name Enrollment** — Automatically asks and learns names of new visitors
+**Conversational AI** — Holds natural conversations using Google Gemini LLM
+**Caption System** — Always-on captions show all interactions with timestamps
+**Interactive Chat** — Type responses during conversations (even when muted)
+**Camera Tracking** — Smoothly follows subjects with PTZ camera control
+**Persistent Database** — Stores learned identities for future recognition
+**Multi-Camera Support** — Works with Amcrest PTZ cameras or any local webcam
+**Graceful Degradation** — Handles failures with natural fallback responses
 
 ---
 
@@ -171,15 +171,10 @@ robo-greeter/
 - **Graceful fallback**: If face recognition fails, ask the person's name. If LLM unavailable, use rule-based responses.
 - **Real-time dashboard**: OpenCV overlay shows video, detected faces, tracked IDs, and chat captions.
 
----
-
-## How This Was Built
-
-This system was architected and implemented with [Claude AI](https://claude.ai) using Claude Code. Below is the master prompt that guided development:
 
 ---
 
-### Master Prompt
+### Master Prompt for AI-First Coding
 
 > You are a senior systems architect and robotics/AI engineer. Your task is to design and implement a production-grade prototype of an intelligent robotic greeter system running on a constrained edge device (Mac Mini) using Python.
 >
@@ -303,11 +298,6 @@ See `requirements.txt`:
 - [ ] Custom wake words for always-listening mode
 - [ ] Privacy mode (face blur, no recording)
 
----
-
-## License
-
-MIT
 
 ---
 
