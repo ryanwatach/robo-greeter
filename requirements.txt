@@ -1,0 +1,11 @@
+face-recognition
+opencv-python
+amcrest
+scipy
+openai-whisper
+elevenlabs
+sounddevice
+python-dotenv
+numpy
+google-genai
+pyttsx3
